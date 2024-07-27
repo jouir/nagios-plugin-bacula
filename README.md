@@ -7,7 +7,7 @@ check_bacula_client
 Dependencies
 ------------
 
-* [Python](http://www.python.org) >= 2.4 < 3.0
+* [Python](http://www.python.org) 3+
 * [pexpect](http://pexpect.sourceforge.net/)
 
 

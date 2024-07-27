@@ -26,7 +26,7 @@ import time
 import pexpect
 
 
-OK, WARNING, CRITICAL, UNKNOWN = xrange(0, 4)
+OK, WARNING, CRITICAL, UNKNOWN = range(0, 4)
 status_message = 'OK WARNING CRITICAL UNKNOWN'.split()
 
 MULTIPLIERS = {'s': 1, 'm': 60, 'h': 3600, 'd': 86400, 'w': 604800}
@@ -90,7 +90,7 @@ def main(argv):
         exit_status, message = (CRITICAL, str(sys.exc_info()[1]))
     child.sendeof()
     child.expect_list([pexpect.EOF, pexpect.TIMEOUT])
-    print '%s: %s' % (status_message[exit_status], message)
+    print(f'{status_message[exit_status]}: {message}')
     sys.exit(exit_status)
 
 
