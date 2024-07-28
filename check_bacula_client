@@ -128,7 +128,7 @@ def main(argv):
     except RuntimeError:
         exit_status, message = (CRITICAL, str(sys.exc_info()[1]))
     child.sendeof()
-    child.expect_list([pexpect.EOF, pexpect.TIMEOUT])
+    child.expect_list(child.compile_pattern_list([pexpect.EOF, pexpect.TIMEOUT]))
     print(f"{status_message[exit_status]}: {message}")
     sys.exit(exit_status)
 
