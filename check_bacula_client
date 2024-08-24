@@ -34,6 +34,8 @@ STATUS_MESSAGES = "OK WARNING CRITICAL UNKNOWN".split()
 MULTIPLIERS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 DIVISORS = ((60, "minutes"), (60, "hours"), (24, "days"), (7, "weeks"))
 
+JOB_INFO_RE = re.compile(r"""^\s*(?P<job_id>\d+)\s+(?P<level>\S+)\s+(?P<files>\S+)\s+(?P<size>\d+\.\d+\s+[KMGTP]|\d+)\s+(?P<status>\S+)\s+(?P<finished>\S+\s+\S+)\s+(?P<name>\w+)""", re.I)
+
 
 def parse_period(option: Option, opt_str: str, value: str, parser: OptionParser):
     """
@@ -65,14 +67,15 @@ def parse_period(option: Option, opt_str: str, value: str, parser: OptionParser)
     )
 
 
-def get_job_info(bconsole_bin: str, client_id: str, backup_job_id: str,
+def get_job_info(bconsole_bin: str, bareos: bool, client_id: str, backup_job_name: str,
                  warn_thres: Optional[timedelta], crit_thres: Optional[timedelta]) -> tuple:
     """Get information about a job from the bconsole
 
     Args:
         bconsole_bin: the path to the bconsole binary
+        bareos: whether or not the bconsole is bareos
         client_id: the name of the client
-        backup_job_id: the name of the backup job
+        backup_job_name: the name of the backup job
         warn_thres: the timedelta for warning
         crit_thres: the timedelta for critical
 
@@ -83,7 +86,7 @@ def get_job_info(bconsole_bin: str, client_id: str, backup_job_id: str,
     exit_status, message = OK, None
 
     # Connect to the bconsole
-    child = pexpect.spawn(bconsole_bin, ["-n"])
+    child = pexpect.spawn(bconsole_bin, ["-n"] if not bareos else [])
     try:
         child.expect(r"\*$")
         child.sendline("status client=%s" % client_id)
@@ -92,6 +95,7 @@ def get_job_info(bconsole_bin: str, client_id: str, backup_job_id: str,
         patterns = child.compile_pattern_list([
             r"Terminated Jobs:",
             r"Error: Client resource .* does not exist.",
+            r"Failed to connect to Client",
             pexpect.TIMEOUT,
         ])
         if child.expect_list(patterns):
@@ -99,49 +103,61 @@ def get_job_info(bconsole_bin: str, client_id: str, backup_job_id: str,
 
         child.expect(r"\*$")
 
-        # Fetch job informations
-        r = re.compile(
-            r"\s*(\d+)\s+(\S+)\s+(\S+)\s+(\d+\.\d+\s+[KMGTP]|\d+)\s+OK\s+(\S+\s+\S+)\s+%s"
-            % re.escape(backup_job_id)
-        )
-        job_id = job_level = job_files = job_size = job_finished = None
+        jobs = {}
         for line in child.before.splitlines():
-            m = r.match(line.decode("utf-8"))
+            m = JOB_INFO_RE.match(line.decode("utf-8"))
             if not m:
                 continue
-            job_id = int(m.group(1))
-            job_level = m.group(2)
-            job_files = int(re.sub(r",", "", m.group(3)))
-            job_size = re.sub(r"\s+", "", m.group(4))
-            job_finished = datetime(*(time.strptime(m.group(5), "%d-%b-%y %H:%M")[0:6]))
-            break
+            job = m.groupdict()
+            job['id'] = int(job['job_id'])
+            job['files'] = int(re.sub(r",", "", job['files']))
+            job['size'] = re.sub(r"\s+", "", job['size'])
+            job['finished'] = datetime(*(time.strptime(job['finished'], "%d-%b-%y %H:%M")[0:6]))
+            jobs[job['name']] = job
 
-        if job_id is None or job_level is None or job_files is None or job_size is None or job_finished is None:
+        if not jobs:
             raise RuntimeError("no terminated jobs")
 
-        age = datetime.now() - job_finished
-        if warn_thres and age > warn_thres:
-            exit_status = WARNING
-        if crit_thres and age > crit_thres:
-            exit_status = CRITICAL
+        messages = []
+        for job_name, job in jobs.items():
+            if backup_job_name and backup_job_name != job_name:
+                continue
 
-        # Format age in human readable format
-        age, units = 24.0 * 60 * 60 * age.days + age.seconds, "seconds"
-        for d, u in DIVISORS:
-            if age < d:
-                break
+            if job['status'] == 'OK':
+                age = datetime.now() - job['finished']
+                if crit_thres and age > crit_thres:
+                    job['status'] = 'TOO OLD'
+                    exit_status = CRITICAL
+                elif warn_thres and age > warn_thres:
+                    job['status'] = 'TOO OLD'
+                    exit_status = WARNING
             else:
-                age /= d
-                units = u
+                exit_status = CRITICAL
 
-        message = "%s, %d files, %sB, %s (%.1f %s ago)" % (
-            job_level,
-            job_files,
-            job_size,
-            job_finished,
-            age,
-            units,
-        )
+            # Format age in human readable format
+            age, units = 24.0 * 60 * 60 * age.days + age.seconds, "seconds"
+            for d, u in DIVISORS:
+                if age < d:
+                    break
+                else:
+                    age /= d
+                    units = u
+
+            messages.append("%s, %s, %d files, %sB, %s (%.1f %s ago)" % (
+                job['name'],
+                job['status'],
+                job['files'],
+                job['size'],
+                job['finished'],
+                age,
+                units
+            ))
+
+        if not messages:
+            raise RuntimeError("no successful jobs")
+
+        message = "\n".join(messages)
+
     except RuntimeError:
         exit_status, message = (CRITICAL, str(sys.exc_info()[1]))
     child.sendeof()
@@ -156,7 +172,7 @@ def main(argv: list[str]):
         "-H", metavar="FD_NAME", dest="client_id", help="client file director name"
     )
     parser.add_option(
-        "-B", metavar="BACKUP_NAME", dest="job_id", help="backup job name"
+        "-B", metavar="BACKUP_NAME", dest="job_name", help="backup job name"
     )
     parser.add_option(
         "-w",
@@ -176,13 +192,16 @@ def main(argv: list[str]):
         callback=parse_period,
         help="generate critical if last successful backup older than PERIOD",
     )
-    parser.add_option("-b", metavar="PATH", dest="bconsole", help="path to bconsole")
-    parser.set_defaults(bconsole="/usr/sbin/bconsole")
+    parser.add_option("--bareos", action="store_true", dest="bareos", help="use bareos client", default=False)
+    parser.add_option("-b", metavar="PATH", dest="bconsole_bin", help="path to bconsole", default="/usr/sbin/bconsole")
     options, args = parser.parse_args(argv[1:])
-    if not options.client_id or not options.job_id:
-        parser.error("-H and -B should be specified.")
 
-    exit_status, message = get_job_info(options.bconsole, options.client_id, options.job_id, options.warning, options.critical)
+    if not options.client_id:
+        print("Missing -H option")
+        parser.print_help()
+        sys.exit(CRITICAL)
+
+    exit_status, message = get_job_info(options.bconsole_bin, options.bareos, options.client_id, options.job_name, options.warning, options.critical)
     print(f"{STATUS_MESSAGES[exit_status]}: {message}")
     sys.exit(exit_status)
 
