@@ -23,7 +23,7 @@ from optparse import OptionParser, OptionValueError, Option
 import re
 import sys
 import time
-from typing import Optional
+from typing import Optional, Tuple, List
 
 import pexpect
 
@@ -37,18 +37,21 @@ DIVISORS = ((60, "minutes"), (60, "hours"), (24, "days"), (7, "weeks"))
 JOB_INFO_RE = re.compile(r"""^\s*(?P<job_id>\d+)\s+(?P<level>\S+)\s+(?P<files>\S+)\s+(?P<size>\d+\.\d+\s+[KMGTP]|\d+)\s+(?P<status>\S+)\s+(?P<finished>\S+\s+\S+)\s+(?P<name>\w+)""", re.I)
 
 
-def parse_period(option: Option, opt_str: str, value: str, parser: OptionParser):
+def parse_period(
+    option: Option,
+    opt_str: str,
+    value: str,
+    parser: OptionParser
+) -> None:
     """
     Parse a period option that is a floating point number followed by a
     unit of time (s, m, h, d, w).  The result is a timedelta object.
 
-    Raises OptionValueError if the value is invalid.
-
     Args:
-        option: the Option object
-        opt_str: the option string
-        value: the value of the option
-        parser: the OptionParser object
+        option: Option object
+        opt_str: str, the option string
+        value: str, the value of the option
+        parser: OptionParser object
 
     Returns:
         None
@@ -67,8 +70,14 @@ def parse_period(option: Option, opt_str: str, value: str, parser: OptionParser)
     )
 
 
-def get_job_info(bconsole_bin: str, bareos: bool, client_id: str, backup_job_name: str,
-                 warn_thres: Optional[timedelta], crit_thres: Optional[timedelta]) -> tuple:
+def get_job_info(
+    bconsole_bin: str,
+    bareos: bool,
+    client_id: str,
+    backup_job_name: Optional[str],
+    warn_thres: Optional[timedelta],
+    crit_thres: Optional[timedelta]
+) -> Tuple[int, str]:
     """Get information about a job from the bconsole
 
     Args:
@@ -166,7 +175,16 @@ def get_job_info(bconsole_bin: str, bareos: bool, client_id: str, backup_job_nam
     return exit_status, message
 
 
-def main(argv: list[str]):
+def main(argv: List[str]) -> int:
+    """
+    Main entry point
+
+    Args:
+        argv: list of command line arguments
+
+    Returns:
+        int: exit code
+    """
     parser = OptionParser()
     parser.add_option(
         "-H", metavar="FD_NAME", dest="client_id", help="client file director name"
@@ -192,19 +210,41 @@ def main(argv: list[str]):
         callback=parse_period,
         help="generate critical if last successful backup older than PERIOD",
     )
-    parser.add_option("--bareos", action="store_true", dest="bareos", help="use bareos client", default=False)
-    parser.add_option("-b", metavar="PATH", dest="bconsole_bin", help="path to bconsole", default="/usr/sbin/bconsole")
+    parser.add_option(
+        "--bareos",
+        action="store_true",
+        dest="bareos",
+        help="use bareos client (remove the unknown argument -n from bconsole)",
+        default=False,
+    )
+    parser.add_option(
+        "-b",
+        metavar="PATH",
+        dest="bconsole_bin",
+        help="path to bconsole",
+        default="/usr/sbin/bconsole",
+    )
+
     options, args = parser.parse_args(argv[1:])
 
+    # If client_id is not provided, show help
     if not options.client_id:
         print("Missing -H option")
         parser.print_help()
-        sys.exit(CRITICAL)
+        return(CRITICAL)
 
-    exit_status, message = get_job_info(options.bconsole_bin, options.bareos, options.client_id, options.job_name, options.warning, options.critical)
+    exit_status, message = get_job_info(
+        options.bconsole_bin,
+        options.bareos,
+        options.client_id,
+        options.job_name,
+        options.warning,
+        options.critical,
+    )
+
     print(f"{STATUS_MESSAGES[exit_status]}: {message}")
-    sys.exit(exit_status)
+    return exit_status
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main(sys.argv))
