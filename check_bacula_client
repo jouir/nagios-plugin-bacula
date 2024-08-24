@@ -3,6 +3,7 @@
 #   check_bacula_client  Nagios plugin to check Bacula client backups
 #   Copyright (C) 2010  Tom Payne
 #   Copyright (C) 2024  Julien Riou
+#   Copyright (C) 2024  Stefan Meinecke
 #
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -135,10 +136,8 @@ def get_job_info(
             if job['status'] == 'OK':
                 age = datetime.now() - job['finished']
                 if crit_thres and age > crit_thres:
-                    job['status'] = 'TOO OLD'
                     exit_status = CRITICAL
                 elif warn_thres and age > warn_thres:
-                    job['status'] = 'TOO OLD'
                     exit_status = WARNING
             else:
                 exit_status = CRITICAL
