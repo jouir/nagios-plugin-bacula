@@ -109,7 +109,7 @@ def get_job_info(
             pexpect.TIMEOUT,
         ])
         if child.expect_list(patterns):
-            raise RuntimeError("Timeout or unknown client: %s" % client_id)
+            raise RuntimeError("Timeout, Failed to connect or unknown client: %s" % client_id)
 
         child.expect(r"\*$")
 
@@ -133,8 +133,8 @@ def get_job_info(
             if backup_job_name and backup_job_name != job_name:
                 continue
 
+            age = datetime.now() - job['finished']
             if job['status'] == 'OK':
-                age = datetime.now() - job['finished']
                 if crit_thres and age > crit_thres:
                     exit_status = CRITICAL
                 elif warn_thres and age > warn_thres:
