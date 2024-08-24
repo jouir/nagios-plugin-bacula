@@ -1,7 +1,8 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 #   check_bacula_client  Nagios plugin to check Bacula client backups
 #   Copyright (C) 2010  Tom Payne
+#   Copyright (C) 2024  Julien Riou
 #
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -18,25 +19,45 @@
 
 
 from datetime import datetime, timedelta
-from optparse import OptionParser, OptionValueError
+from optparse import OptionParser, OptionValueError, Option
 import re
 import sys
 import time
+from typing import Optional
 
 import pexpect
 
 
 OK, WARNING, CRITICAL, UNKNOWN = range(0, 4)
-status_message = "OK WARNING CRITICAL UNKNOWN".split()
+STATUS_MESSAGES = "OK WARNING CRITICAL UNKNOWN".split()
 
 MULTIPLIERS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 DIVISORS = ((60, "minutes"), (60, "hours"), (24, "days"), (7, "weeks"))
 
 
-def parse_period(option, opt_str, value, parser):
-    m = re.match(r"(\d+(?:\.\d+)?)(%s)\Z" % "|".join(MULTIPLIERS.keys()), value)
+def parse_period(option: Option, opt_str: str, value: str, parser: OptionParser):
+    """
+    Parse a period option that is a floating point number followed by a
+    unit of time (s, m, h, d, w).  The result is a timedelta object.
+
+    Raises OptionValueError if the value is invalid.
+
+    Args:
+        option: the Option object
+        opt_str: the option string
+        value: the value of the option
+        parser: the OptionParser object
+
+    Returns:
+        None
+    """
+    m = re.match(
+        r"(\d+(?:\.\d+)?)(%s)\Z" % "|".join(MULTIPLIERS.keys()), value
+    )
     if not m:
         raise OptionValueError("invalid period - %s" % value)
+
+    # Set the attribute with the parsed value
     setattr(
         parser.values,
         option.dest,
@@ -44,13 +65,98 @@ def parse_period(option, opt_str, value, parser):
     )
 
 
-def main(argv):
+def get_job_info(bconsole_bin: str, client_id: str, backup_job_id: str,
+                 warn_thres: Optional[timedelta], crit_thres: Optional[timedelta]) -> tuple:
+    """Get information about a job from the bconsole
+
+    Args:
+        bconsole_bin: the path to the bconsole binary
+        client_id: the name of the client
+        backup_job_id: the name of the backup job
+        warn_thres: the timedelta for warning
+        crit_thres: the timedelta for critical
+
+    Returns:
+        tuple: exit_status (int) and message (str)
+    """
+    # Set default status
+    exit_status, message = OK, None
+
+    # Connect to the bconsole
+    child = pexpect.spawn(bconsole_bin, ["-n"])
+    try:
+        child.expect(r"\*$")
+        child.sendline("status client=%s" % client_id)
+
+        # Error list to check for if the client does not exist or job has failed
+        patterns = child.compile_pattern_list([
+            r"Terminated Jobs:",
+            r"Error: Client resource .* does not exist.",
+            pexpect.TIMEOUT,
+        ])
+        if child.expect_list(patterns):
+            raise RuntimeError("Timeout or unknown client: %s" % client_id)
+
+        child.expect(r"\*$")
+
+        # Fetch job informations
+        r = re.compile(
+            r"\s*(\d+)\s+(\S+)\s+(\S+)\s+(\d+\.\d+\s+[KMGTP]|\d+)\s+OK\s+(\S+\s+\S+)\s+%s"
+            % re.escape(backup_job_id)
+        )
+        job_id = job_level = job_files = job_size = job_finished = None
+        for line in child.before.splitlines():
+            m = r.match(line.decode("utf-8"))
+            if not m:
+                continue
+            job_id = int(m.group(1))
+            job_level = m.group(2)
+            job_files = int(re.sub(r",", "", m.group(3)))
+            job_size = re.sub(r"\s+", "", m.group(4))
+            job_finished = datetime(*(time.strptime(m.group(5), "%d-%b-%y %H:%M")[0:6]))
+            break
+
+        if job_id is None or job_level is None or job_files is None or job_size is None or job_finished is None:
+            raise RuntimeError("no terminated jobs")
+
+        age = datetime.now() - job_finished
+        if warn_thres and age > warn_thres:
+            exit_status = WARNING
+        if crit_thres and age > crit_thres:
+            exit_status = CRITICAL
+
+        # Format age in human readable format
+        age, units = 24.0 * 60 * 60 * age.days + age.seconds, "seconds"
+        for d, u in DIVISORS:
+            if age < d:
+                break
+            else:
+                age /= d
+                units = u
+
+        message = "%s, %d files, %sB, %s (%.1f %s ago)" % (
+            job_level,
+            job_files,
+            job_size,
+            job_finished,
+            age,
+            units,
+        )
+    except RuntimeError:
+        exit_status, message = (CRITICAL, str(sys.exc_info()[1]))
+    child.sendeof()
+    child.expect_list(child.compile_pattern_list([pexpect.EOF, pexpect.TIMEOUT]))
+
+    return exit_status, message
+
+
+def main(argv: list[str]):
     parser = OptionParser()
     parser.add_option(
-        "-H", metavar="FD_NAME", dest="hostid", help="client file director name"
+        "-H", metavar="FD_NAME", dest="client_id", help="client file director name"
     )
     parser.add_option(
-        "-B", metavar="BACKUP_NAME", dest="backupid", help="backup job name"
+        "-B", metavar="BACKUP_NAME", dest="job_id", help="backup job name"
     )
     parser.add_option(
         "-w",
@@ -73,63 +179,11 @@ def main(argv):
     parser.add_option("-b", metavar="PATH", dest="bconsole", help="path to bconsole")
     parser.set_defaults(bconsole="/usr/sbin/bconsole")
     options, args = parser.parse_args(argv[1:])
-    if not options.hostid or not options.backupid:
+    if not options.client_id or not options.job_id:
         parser.error("-H and -B should be specified.")
-    exit_status, message = OK, None
-    child = pexpect.spawn(options.bconsole, ["-n"])
-    hostid = options.hostid
-    backupid = options.backupid
-    try:
-        child.expect(r"\*$")
-        child.sendline("status client=%s" % hostid)
-        patterns = child.compile_pattern_list([
-            r"Terminated Jobs:",
-            r"Error: Client resource .* does not exist.",
-            pexpect.TIMEOUT,
-        ])
-        if child.expect_list(patterns):
-            raise RuntimeError("Timeout or unknown client: %s" % hostid)
-        child.expect(r"\*$")
-        r = re.compile(
-            r"\s*(\d+)\s+(\S+)\s+(\S+)\s+(\d+\.\d+\s+[KMGTP]|\d+)\s+OK\s+(\S+\s+\S+)\s+%s"
-            % re.escape(backupid)
-        )
-        job_id = level = files = bytes = finished = None
-        for line in child.before.splitlines():
-            m = r.match(line.decode("utf-8"))
-            if m:
-                job_id = int(m.group(1))
-                level = m.group(2)
-                files = int(re.sub(r",", "", m.group(3)))
-                bytes = re.sub(r"\s+", "", m.group(4))
-                finished = datetime(*(time.strptime(m.group(5), "%d-%b-%y %H:%M")[0:6]))
-        if job_id is None:
-            raise RuntimeError("no terminated jobs")
-        age = datetime.now() - finished
-        if options.warning and age > options.warning:
-            exit_status = WARNING
-        if options.critical and age > options.critical:
-            exit_status = CRITICAL
-        age, units = 24.0 * 60 * 60 * age.days + age.seconds, "seconds"
-        for d, u in DIVISORS:
-            if age < d:
-                break
-            else:
-                age /= d
-                units = u
-        message = "%s, %d files, %sB, %s (%.1f %s ago)" % (
-            level,
-            files,
-            bytes,
-            finished,
-            age,
-            units,
-        )
-    except RuntimeError:
-        exit_status, message = (CRITICAL, str(sys.exc_info()[1]))
-    child.sendeof()
-    child.expect_list(child.compile_pattern_list([pexpect.EOF, pexpect.TIMEOUT]))
-    print(f"{status_message[exit_status]}: {message}")
+
+    exit_status, message = get_job_info(options.bconsole, options.client_id, options.job_id, options.warning, options.critical)
+    print(f"{STATUS_MESSAGES[exit_status]}: {message}")
     sys.exit(exit_status)
 
 
