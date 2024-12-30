@@ -1,7 +1,9 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #
 #   check_bacula_client  Nagios plugin to check Bacula client backups
 #   Copyright (C) 2010  Tom Payne
+#   Copyright (C) 2024  Julien Riou
+#   Copyright (C) 2024  Stefan Meinecke
 #
 #   This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -18,25 +20,50 @@
 
 
 from datetime import datetime, timedelta
-from optparse import OptionParser, OptionValueError
+from optparse import OptionParser, OptionValueError, Option
 import re
 import sys
 import time
+from typing import Optional, Tuple, List
 
 import pexpect
 
 
 OK, WARNING, CRITICAL, UNKNOWN = range(0, 4)
-status_message = "OK WARNING CRITICAL UNKNOWN".split()
+STATUS_MESSAGES = "OK WARNING CRITICAL UNKNOWN".split()
 
 MULTIPLIERS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 DIVISORS = ((60, "minutes"), (60, "hours"), (24, "days"), (7, "weeks"))
 
+JOB_INFO_RE = re.compile(r"""^\s*(?P<job_id>\d+)\s+(?P<level>\S+)\s+(?P<files>\S+)\s+(?P<size>\d+\.\d+\s+[KMGTP]|\d+)\s+(?P<status>\S+)\s+(?P<finished>\S+\s+\S+)\s+(?P<name>\w+)""", re.I)
 
-def parse_period(option, opt_str, value, parser):
-    m = re.match(r"(\d+(?:\.\d+)?)(%s)\Z" % "|".join(MULTIPLIERS.keys()), value)
+
+def parse_period(
+    option: Option,
+    opt_str: str,
+    value: str,
+    parser: OptionParser
+) -> None:
+    """
+    Parse a period option that is a floating point number followed by a
+    unit of time (s, m, h, d, w).  The result is a timedelta object.
+
+    Args:
+        option: Option object
+        opt_str: str, the option string
+        value: str, the value of the option
+        parser: OptionParser object
+
+    Returns:
+        None
+    """
+    m = re.match(
+        r"(\d+(?:\.\d+)?)(%s)\Z" % "|".join(MULTIPLIERS.keys()), value
+    )
     if not m:
         raise OptionValueError("invalid period - %s" % value)
+
+    # Set the attribute with the parsed value
     setattr(
         parser.values,
         option.dest,
@@ -44,13 +71,125 @@ def parse_period(option, opt_str, value, parser):
     )
 
 
-def main(argv):
+def get_job_info(
+    bconsole_bin: str,
+    bareos: bool,
+    client_id: str,
+    backup_job_name: Optional[str],
+    warn_thres: Optional[timedelta],
+    crit_thres: Optional[timedelta]
+) -> Tuple[int, str]:
+    """Get information about a job from the bconsole
+
+    Args:
+        bconsole_bin: the path to the bconsole binary
+        bareos: whether or not the bconsole is bareos
+        client_id: the name of the client
+        backup_job_name: the name of the backup job
+        warn_thres: the timedelta for warning
+        crit_thres: the timedelta for critical
+
+    Returns:
+        tuple: exit_status (int) and message (str)
+    """
+    # Set default status
+    exit_status, message = OK, None
+
+    # Connect to the bconsole
+    child = pexpect.spawn(bconsole_bin, ["-n"] if not bareos else [])
+    try:
+        child.expect(r"\*$")
+        child.sendline("status client=%s" % client_id)
+
+        # Error list to check for if the client does not exist or job has failed
+        patterns = child.compile_pattern_list([
+            r"Terminated Jobs:",
+            r"Error: Client resource .* does not exist.",
+            r"Failed to connect to Client",
+            pexpect.TIMEOUT,
+        ])
+        if child.expect_list(patterns):
+            raise RuntimeError("Timeout, Failed to connect or unknown client: %s" % client_id)
+
+        child.expect(r"\*$")
+
+        jobs = {}
+        for line in child.before.splitlines():
+            m = JOB_INFO_RE.match(line.decode("utf-8"))
+            if not m:
+                continue
+            job = m.groupdict()
+            job['id'] = int(job['job_id'])
+            job['files'] = int(re.sub(r",", "", job['files']))
+            job['size'] = re.sub(r"\s+", "", job['size'])
+            job['finished'] = datetime(*(time.strptime(job['finished'], "%d-%b-%y %H:%M")[0:6]))
+            jobs[job['name']] = job
+
+        if not jobs:
+            raise RuntimeError("no terminated jobs")
+
+        messages = []
+        for job_name, job in jobs.items():
+            if backup_job_name and backup_job_name != job_name:
+                continue
+
+            age = datetime.now() - job['finished']
+            if job['status'] == 'OK':
+                if crit_thres and age > crit_thres:
+                    exit_status = CRITICAL
+                elif warn_thres and age > warn_thres:
+                    exit_status = WARNING
+            else:
+                exit_status = CRITICAL
+
+            # Format age in human readable format
+            age, units = 24.0 * 60 * 60 * age.days + age.seconds, "seconds"
+            for d, u in DIVISORS:
+                if age < d:
+                    break
+                else:
+                    age /= d
+                    units = u
+
+            messages.append("%s, %s, %d files, %sB, %s (%.1f %s ago)" % (
+                job['name'],
+                job['status'],
+                job['files'],
+                job['size'],
+                job['finished'],
+                age,
+                units
+            ))
+
+        if not messages:
+            raise RuntimeError("no successful jobs")
+
+        message = "\n".join(messages)
+
+    except RuntimeError:
+        exit_status, message = (CRITICAL, str(sys.exc_info()[1]))
+    child.sendeof()
+    child.expect_list(child.compile_pattern_list([pexpect.EOF, pexpect.TIMEOUT]))
+
+    return exit_status, message
+
+
+def main(argv: List[str]) -> int:
+    """
+    Main entry point
+
+    Args:
+        argv: list of command line arguments
+
+    Returns:
+        int: exit code
+    """
     parser = OptionParser()
     parser.add_option(
-        "-H", metavar="FD_NAME", dest="hostid", help="client file director name"
+        "-H", metavar="FD_NAME", dest="client_id", help="client file director name"
     )
     parser.add_option(
-        "-B", metavar="BACKUP_NAME", dest="backupid", help="backup job name"
+        "-B", metavar="BACKUP_NAME", dest="job_name", help="backup job name"
     )
     parser.add_option(
         "-w",
@@ -70,68 +209,41 @@ def main(argv):
         callback=parse_period,
         help="generate critical if last successful backup older than PERIOD",
     )
-    parser.add_option("-b", metavar="PATH", dest="bconsole", help="path to bconsole")
-    parser.set_defaults(bconsole="/usr/sbin/bconsole")
+    parser.add_option(
+        "--bareos",
+        action="store_true",
+        dest="bareos",
+        help="use bareos client (remove the unknown argument -n from bconsole)",
+        default=False,
+    )
+    parser.add_option(
+        "-b",
+        metavar="PATH",
+        dest="bconsole_bin",
+        help="path to bconsole",
+        default="/usr/sbin/bconsole",
+    )
+
     options, args = parser.parse_args(argv[1:])
-    if not options.hostid or not options.backupid:
-        parser.error("-H and -B should be specified.")
-    exit_status, message = OK, None
-    child = pexpect.spawn(options.bconsole, ["-n"])
-    hostid = options.hostid
-    backupid = options.backupid
-    try:
-        child.expect(r"\*$")
-        child.sendline("status client=%s" % hostid)
-        patterns = child.compile_pattern_list([
-            r"Terminated Jobs:",
-            r"Error: Client resource .* does not exist.",
-            pexpect.TIMEOUT,
-        ])
-        if child.expect_list(patterns):
-            raise RuntimeError("Timeout or unknown client: %s" % hostid)
-        child.expect(r"\*$")
-        r = re.compile(
-            r"\s*(\d+)\s+(\S+)\s+(\S+)\s+(\d+\.\d+\s+[KMGTP]|\d+)\s+OK\s+(\S+\s+\S+)\s+%s"
-            % re.escape(backupid)
-        )
-        job_id = level = files = bytes = finished = None
-        for line in child.before.splitlines():
-            m = r.match(line.decode("utf-8"))
-            if m:
-                job_id = int(m.group(1))
-                level = m.group(2)
-                files = int(re.sub(r",", "", m.group(3)))
-                bytes = re.sub(r"\s+", "", m.group(4))
-                finished = datetime(*(time.strptime(m.group(5), "%d-%b-%y %H:%M")[0:6]))
-        if job_id is None:
-            raise RuntimeError("no terminated jobs")
-        age = datetime.now() - finished
-        if options.warning and age > options.warning:
-            exit_status = WARNING
-        if options.critical and age > options.critical:
-            exit_status = CRITICAL
-        age, units = 24.0 * 60 * 60 * age.days + age.seconds, "seconds"
-        for d, u in DIVISORS:
-            if age < d:
-                break
-            else:
-                age /= d
-                units = u
-        message = "%s, %d files, %sB, %s (%.1f %s ago)" % (
-            level,
-            files,
-            bytes,
-            finished,
-            age,
-            units,
-        )
-    except RuntimeError:
-        exit_status, message = (CRITICAL, str(sys.exc_info()[1]))
-    child.sendeof()
-    child.expect_list(child.compile_pattern_list([pexpect.EOF, pexpect.TIMEOUT]))
-    print(f"{status_message[exit_status]}: {message}")
-    sys.exit(exit_status)
+
+    # If client_id is not provided, show help
+    if not options.client_id:
+        print("Missing -H option")
+        parser.print_help()
+        return(CRITICAL)
+
+    exit_status, message = get_job_info(
+        options.bconsole_bin,
+        options.bareos,
+        options.client_id,
+        options.job_name,
+        options.warning,
+        options.critical,
+    )
+
+    print(f"{STATUS_MESSAGES[exit_status]}: {message}")
+    return exit_status
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main(sys.argv))
